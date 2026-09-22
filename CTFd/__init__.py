@@ -101,6 +101,25 @@ class SandboxedBaseEnvironment(SandboxedEnvironment):
             options["finalize"] = lambda x: x if x is not None else ""
         SandboxedEnvironment.__init__(self, **options)
         self.app = app
+        # Template cache keys contain a weakref to the loader. When a loader
+        # is garbage collected its cache keys die, but the stale entries remain
+        # in the LRU cache. A dead weakref raises ``TypeError`` when hashed
+        # (e.g. during LRU eviction or lookup), crashing later template loads.
+        # Purge the stale entries as soon as the loader is collected.
+        if self.cache is not None and self.loader is not None:
+            weakref.finalize(
+                self.loader,
+                self._purge_loader_cache_entries,
+                self.cache,
+                weakref.ref(self.loader),
+            )
+
+    @staticmethod
+    def _purge_loader_cache_entries(template_cache, dead_loader_ref):
+        def matches(key):
+            return isinstance(key, tuple) and key and key[0] is dead_loader_ref
+
+        SandboxedBaseEnvironment._purge_template_cache(template_cache, matches)
 
     def _load_template(self, name, globals):
         if self.loader is None:
@@ -116,7 +135,13 @@ class SandboxedBaseEnvironment(SandboxedEnvironment):
         # https://github.com/pallets/jinja/blob/b08cd4bc64bb980df86ed2876978ae5735572280/src/jinja2/environment.py#L956-L973
         cache_key = (weakref.ref(self.loader), cache_name)
         if self.cache is not None:
-            template = self.cache.get(cache_key)
+            try:
+                template = self.cache.get(cache_key)
+            except (TypeError, KeyError):
+                # A stale entry whose loader weakref has died corrupts cache
+                # key hashing/comparison. Drop it and load from the loader.
+                template = None
+                self._purge_dead_loader_entries()
             if template is not None and (
                 not self.auto_reload or template.is_up_to_date
             ):
@@ -130,8 +155,57 @@ class SandboxedBaseEnvironment(SandboxedEnvironment):
         template = self.loader.load(self, name, self.make_globals(globals))
 
         if self.cache is not None:
-            self.cache[cache_key] = template
+            try:
+                self.cache[cache_key] = template
+            except TypeError:
+                # Eviction may hash a different stale key whose loader weakref
+                # has died. The finalize() callback normally prevents this, but
+                # guard the write so a poisoned entry cannot crash rendering.
+                self._purge_dead_loader_entries()
+                try:
+                    self.cache[cache_key] = template
+                except TypeError:
+                    pass
         return template
+
+    def _purge_dead_loader_entries(self):
+        if self.cache is None:
+            return
+        self._purge_template_cache(
+            self.cache,
+            lambda key: isinstance(key, tuple)
+            and key
+            and isinstance(key[0], weakref.ref)
+            and key[0]() is None,
+        )
+
+    @staticmethod
+    def _purge_template_cache(template_cache, predicate):
+        """Remove matching entries without ever hashing a stale key.
+
+        ``LRUCache.__delitem__`` and cache eviction hash the key, and a dead
+        loader weakref raises ``TypeError`` when hashed. Identify the stale
+        entries from the internal key queue (identity comparison, no hashing)
+        and remove them directly from the underlying mapping/queue.
+        """
+        if isinstance(template_cache, jinja2.utils.LRUCache):
+            mapping = template_cache._mapping
+            queue = template_cache._queue
+        else:
+            for key in list(template_cache.keys()):
+                try:
+                    if predicate(key):
+                        del template_cache[key]
+                except (TypeError, KeyError):
+                    pass
+            return
+        stale_keys = [key for key in list(queue) if predicate(key)]
+        stale_ids = {id(key) for key in stale_keys}
+        surviving_keys = [key for key in list(queue) if id(key) not in stale_ids]
+        queue.clear()
+        queue.extend(surviving_keys)
+        for key in stale_keys:
+            mapping.pop(key, None)
 
 
 class ThemeLoader(FileSystemLoader):
@@ -150,6 +224,40 @@ class ThemeLoader(FileSystemLoader):
         super(ThemeLoader, self).__init__(searchpath, encoding, followlinks)
         self.theme_name = theme_name
 
+    def _valid_theme_name(self, theme_name):
+        """Validate the theme name against the themes available on disk.
+
+        ``theme_name`` can originate from the ``ctf_theme`` database config.
+        ``safe_join`` only prevents the template component from escaping the
+        joined path; a tampered config value containing path separators or
+        traversal sequences (e.g. ``../../etc`` or an absolute path) could
+        otherwise point the loader at arbitrary directories. Restrict names to
+        directories that actually exist under the themes path.
+        """
+        if not theme_name:
+            return False
+        if theme_name in (ADMIN_THEME, DEFAULT_THEME):
+            return True
+        try:
+            available_themes = CTFd.utils.config.get_themes()
+        except Exception:
+            available_themes = ()
+        if theme_name in available_themes:
+            return True
+        searchpath = self.searchpath
+        if not isinstance(searchpath, str):
+            searchpath = next(iter(searchpath), self.DEFAULT_THEMES_PATH)
+        # A plain theme directory name contains no path separators and must
+        # resolve to a real directory staying inside the themes tree.
+        if (
+            os.path.isabs(theme_name)
+            or os.sep in theme_name
+            or (os.altsep and os.altsep in theme_name)
+            or theme_name in (os.curdir, os.pardir)
+        ):
+            return False
+        return os.path.isdir(os.path.join(searchpath, theme_name))
+
     def get_source(self, environment, template):
         # Refuse to load `admin/*` from a loader not for the admin theme
         # Because there is a single template loader, themes can essentially
@@ -161,7 +269,11 @@ class ThemeLoader(FileSystemLoader):
                 raise jinja2.TemplateNotFound(template)
             template = template[len(self._ADMIN_THEME_PREFIX) :]
         theme_name = self.theme_name or str(utils.get_config("ctf_theme"))
+        if not theme_name or self._valid_theme_name(theme_name) is False:
+            raise jinja2.TemplateNotFound(template)
         template = safe_join(theme_name, "templates", template)
+        if template is None:
+            raise jinja2.TemplateNotFound(template)
         return super(ThemeLoader, self).get_source(environment, template)
 
 

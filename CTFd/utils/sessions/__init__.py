@@ -21,18 +21,26 @@ class CachedSession(CallbackDict, SessionMixin):
     https://github.com/fengsp/flask-session/blob/master/flask_session/sessions.py#L37
     """
 
-    def __init__(self, initial=None, sid=None, permanent=None):
+    def __init__(self, initial=None, sid=None, permanent=None, key_prefix=""):
         def on_update(self):
             self.modified = True
 
         CallbackDict.__init__(self, initial, on_update)
         self.sid = sid
+        self.key_prefix = key_prefix
         if permanent:
             self.permanent = permanent
         self.modified = False
 
     def regenerate(self):
-        cache.delete(self.sid)
+        # Delete the old server side session so that the new sid cannot be
+        # associated with a stale session object. The key prefix must be
+        # included: sessions are stored as ``key_prefix + sid`` and cache
+        # backends (e.g. Redis) expire entries via TTL instead of deleting
+        # them instantly, so a uuid4 collision with a lingering entry would
+        # otherwise resurrect the previous session.
+        if self.sid is not None:
+            cache.delete(self.key_prefix + self.sid)
 
         # Empty current sid and mark modified so the interface will give it a new one.
         self.sid = None
@@ -51,12 +59,25 @@ class CachingSessionInterface(SessionInterface):
     session_class = CachedSession
 
     def _generate_sid(self):
+        # Generate a uuid4 sid that is not already in use. Although uuid4
+        # collisions are astronomically unlikely, cache backends expire old
+        # sessions via TTL rather than removing them immediately; a sid that
+        # collides with a lingering entry would attach the new session to the
+        # previous user's data. Retry until a genuinely unused sid is found.
         sid = str(uuid4())
         v = cache.get(key=self.key_prefix + sid)
         while v:
             sid = str(uuid4())
             v = cache.get(key=self.key_prefix + sid)
         return sid
+
+    def _new_session(self, initial=None, sid=None):
+        return self.session_class(
+            initial=initial,
+            sid=sid,
+            permanent=self.permanent,
+            key_prefix=self.key_prefix,
+        )
 
     def __init__(self, key_prefix, use_signer=True, permanent=False):
         self.key_prefix = key_prefix
@@ -67,7 +88,7 @@ class CachingSessionInterface(SessionInterface):
         sid = request.cookies.get(app.session_cookie_name)
         if not sid:
             sid = self._generate_sid()
-            return self.session_class(sid=sid, permanent=self.permanent)
+            return self._new_session(sid=sid)
 
         if self.use_signer:
             try:
@@ -75,7 +96,7 @@ class CachingSessionInterface(SessionInterface):
                 sid = sid_as_bytes.decode()
             except BadSignature:
                 sid = self._generate_sid()
-                return self.session_class(sid=sid, permanent=self.permanent)
+                return self._new_session(sid=sid)
 
         if isinstance(sid, text_type) is False:
             sid = sid.decode("utf-8", "strict")
@@ -83,10 +104,10 @@ class CachingSessionInterface(SessionInterface):
         if val is not None:
             try:
                 data = self.serializer.loads(val)
-                return self.session_class(data, sid=sid)
+                return self._new_session(initial=data, sid=sid)
             except Exception:
-                return self.session_class(sid=sid, permanent=self.permanent)
-        return self.session_class(sid=sid, permanent=self.permanent)
+                return self._new_session(sid=sid)
+        return self._new_session(sid=sid)
 
     def save_session(self, app, session, response):
         domain = self.get_cookie_domain(app)
@@ -94,7 +115,8 @@ class CachingSessionInterface(SessionInterface):
 
         if not session:
             if session.modified:
-                cache.delete(self.key_prefix + session.sid)
+                if session.sid is not None:
+                    cache.delete(self.key_prefix + session.sid)
                 response.delete_cookie(
                     app.session_cookie_name, domain=domain, path=path
                 )
