@@ -1,15 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import gc
 import os
 import shutil
+import weakref
 
+import jinja2
 import pytest
 from flask import render_template, render_template_string, request
 from jinja2.exceptions import TemplateNotFound
 from jinja2.sandbox import SecurityError
 from werkzeug.test import Client
 
+from CTFd import ThemeLoader
 from CTFd.config import TestingConfig
 from CTFd.utils import get_config, set_config
 from tests.helpers import create_ctfd, destroy_ctfd, gen_user, login_as_user
@@ -259,3 +263,80 @@ def test_theme_template_disallow_loading_admin_templates():
                 os.path.join(app.root_path, "themes", "foo_disallow"),
                 ignore_errors=True,
             )
+
+
+@pytest.mark.parametrize(
+    "malicious_theme",
+    [
+        "../",
+        "..",
+        "../../etc",
+        "../core",
+        "core/../../../admin",
+        "core\\..\\..\\admin",
+        "/etc",
+        "core/../../../../../../etc/passwd",
+    ],
+)
+def test_theme_loader_rejects_path_traversal_theme_name(malicious_theme):
+    """A tampered theme name must never resolve outside of the themes dir"""
+    app = create_ctfd()
+    with app.app_context():
+        loader = ThemeLoader(theme_name=malicious_theme)
+        with pytest.raises(TemplateNotFound):
+            loader.get_source(app.jinja_env, "page.html")
+    destroy_ctfd(app)
+
+
+def test_theme_loader_rejects_traversal_from_tampered_config():
+    """get_config() value driving the default loader must be validated"""
+    app = create_ctfd()
+    with app.app_context():
+        set_config("ctf_theme", "../../../../../../../etc")
+        loader = ThemeLoader()
+        with pytest.raises(TemplateNotFound):
+            loader.get_source(app.jinja_env, "page.html")
+    destroy_ctfd(app)
+
+
+def test_theme_loader_accepts_legitimate_theme_name():
+    """Validation must not break loading of a real theme template"""
+    app = create_ctfd()
+    with app.app_context():
+        loader = ThemeLoader(theme_name="core")
+        source, _, _ = loader.get_source(app.jinja_env, "page.html")
+        assert len(source) > 0
+    destroy_ctfd(app)
+
+
+def test_jinja_template_cache_keys_survive_loader_gc():
+    """
+    Template cache keys must hold a strong reference to the loader. The old
+    weakref-based key died with the loader and left stale unhashable entries in
+    the LRU cache.
+    """
+    app = create_ctfd()
+    with app.test_request_context():
+        render_template("page.html", content="first")
+
+        env = app.jinja_env
+        throwaway_loader = jinja2.DictLoader({})
+        env.loader = throwaway_loader
+        gc.collect()
+
+        del throwaway_loader
+        gc.collect()
+
+        # Restore the real loader and render again; this must not crash and the
+        # restored entry must be served from cache afterwards.
+        env.loader = app.jinja_loader
+        rendered = render_template("page.html", content="second")
+        assert "second" in rendered
+
+        # No cache key may be a (dead) weakref; every key's loader component has
+        # to stay hashable for the lifetime of the cache.
+        for key in list(env.cache.keys()):
+            assert not isinstance(key, tuple) or not isinstance(
+                key[0], weakref.ref
+            )
+    destroy_ctfd(app)

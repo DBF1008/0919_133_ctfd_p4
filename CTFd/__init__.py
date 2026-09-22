@@ -1,8 +1,8 @@
 import datetime
 import os
+import re
 import sys
 import time
-import weakref
 from distutils.version import StrictVersion
 
 import jinja2
@@ -114,9 +114,19 @@ class SandboxedBaseEnvironment(SandboxedEnvironment):
 
         # Rest of this code roughly copied from Jinja
         # https://github.com/pallets/jinja/blob/b08cd4bc64bb980df86ed2876978ae5735572280/src/jinja2/environment.py#L956-L973
-        cache_key = (weakref.ref(self.loader), cache_name)
+        # Use the loader itself (a strong reference) as part of the cache key
+        # instead of a weakref. A weakref becomes dead once the loader it points
+        # to is garbage collected; the LRU cache then keeps stale entries whose
+        # key can no longer be hashed, which crashes subsequent template loads.
+        cache_key = (self.loader, cache_name)
         if self.cache is not None:
-            template = self.cache.get(cache_key)
+            try:
+                template = self.cache.get(cache_key)
+            except TypeError:
+                # Cache holds stale entries keyed by dead weakrefs that cannot
+                # be hashed anymore; clear them and reload the template.
+                self.cache.clear()
+                template = None
             if template is not None and (
                 not self.auto_reload or template.is_up_to_date
             ):
@@ -139,6 +149,10 @@ class ThemeLoader(FileSystemLoader):
 
     DEFAULT_THEMES_PATH = os.path.join(os.path.dirname(__file__), "themes")
     _ADMIN_THEME_PREFIX = ADMIN_THEME + "/"
+    # A theme name is always a single directory component and may never
+    # contain path separators or parent directory references. The config table
+    # can be tampered with so the value must not be trusted blindly.
+    _VALID_THEME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
     def __init__(
         self,
@@ -161,8 +175,25 @@ class ThemeLoader(FileSystemLoader):
                 raise jinja2.TemplateNotFound(template)
             template = template[len(self._ADMIN_THEME_PREFIX) :]
         theme_name = self.theme_name or str(utils.get_config("ctf_theme"))
-        template = safe_join(theme_name, "templates", template)
+        if self._is_valid_theme_name(theme_name) is False:
+            raise jinja2.TemplateNotFound(template)
+        joined = safe_join(theme_name, "templates", template)
+        # Defense in depth: older/newer Werkzeug versions may encode a failed
+        # join differently and ``safe_join`` alone must not be bypassed.
+        if joined is None or os.pardir in os.path.normpath(joined).split(os.sep):
+            raise jinja2.TemplateNotFound(template)
+        template = joined
         return super(ThemeLoader, self).get_source(environment, template)
+
+    @classmethod
+    def _is_valid_theme_name(cls, theme_name):
+        if not theme_name or not isinstance(theme_name, str):
+            return False
+        if theme_name in (os.curdir, os.pardir):
+            return False
+        if os.sep in theme_name or (os.altsep and os.altsep in theme_name):
+            return False
+        return cls._VALID_THEME_NAME.match(theme_name) is not None
 
 
 def confirm_upgrade():
